@@ -16,6 +16,11 @@ import java.lang.reflect.Method;
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public class FileConsumer extends NewCDMConsumer {
     
@@ -23,6 +28,8 @@ public class FileConsumer extends NewCDMConsumer {
     
     public static boolean writeJson = false;
     public static boolean writeBinary = false;
+
+    public static boolean showTime = false;
     public static long rolloverRecordCount = 20000000;
     public static String outputFilePrefix = null; // Use the topic name
     public static String outputFileSuffix = null;
@@ -47,6 +54,9 @@ public class FileConsumer extends NewCDMConsumer {
 
     ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
 
+    private static LocalDateTime timeBaseLineStart = null;
+    private static LocalDateTime timeBaseLineEnd = null;
+
     private static final String UUID_SCHEMA_JSON = "{\n" +
             "  \"type\": \"fixed\",\n" +
             "  \"name\": \"UUID\",\n" +
@@ -55,16 +65,23 @@ public class FileConsumer extends NewCDMConsumer {
             "}";
 
     private boolean logStartRecord = false;
-    private int count = 0;
+
+    private final AtomicInteger count = new AtomicInteger(0);
+
+    public int getCount() {
+        return this.count.get();
+    }
+
     private static final Schema UUID_SCHEMA = new Schema.Parser().parse(UUID_SCHEMA_JSON);
 
     DatumWriter<UUID> writer = new SpecificDatumWriter<>(UUID_SCHEMA);
+
+    public static List<String> filterUUIDs = new ArrayList<>();
 
     public FileConsumer() {
         this(kafkaServer, consumerGroupID, topicStr, duration,
              consumerSchemaFilename);
     }
-    
     public FileConsumer(String kafkaServer, String groupId, String topics,
             int duration, String consumerSchemaFilename) {
         super(kafkaServer, groupId, topics, duration, consumeAll, isSpecific,
@@ -75,11 +92,10 @@ public class FileConsumer extends NewCDMConsumer {
     
     public static boolean parseAdditionalArgs(String[] args) {
         int index = 0;
-
         if (topicStr.startsWith("file:")) {
             filename = topicStr.replace("file:", "").trim();
         }
-        
+
         //verify the file record exists
         if(filename != null) {
             consumeFromFile = new File(filename);
@@ -115,6 +131,22 @@ public class FileConsumer extends NewCDMConsumer {
                 outputDir = args[index];
             } else if(option.equals("-c")){
                 isSpecific = true;
+            } else if (option.equals("-startTime")){
+                index++;
+                String startTimeStr =  args[index];
+                DateTimeFormatter formatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
+                timeBaseLineStart = LocalDateTime.parse(startTimeStr, formatter);
+            } else if (option.equals("-endTime")){
+                index++;
+                String endTimeStr = args[index];
+                DateTimeFormatter formatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
+                timeBaseLineEnd = LocalDateTime.parse(endTimeStr, formatter);
+            }else if (option.equals("-uuid")) {
+                index++;
+                String uuidStr = args[index];
+                filterUUIDs = Arrays.asList(uuidStr.split(","));
+            }else if (option.equals("-time")){
+                showTime = true;
             }
             index++;
         } 
@@ -193,7 +225,7 @@ public class FileConsumer extends NewCDMConsumer {
             logger.info("Writing JSON to "+outputFileJson.getAbsolutePath());
             try {
                 jsonFileSerializer = new AvroGenericSerializer<>(consumerSchemaFilename, true, outputFileJson, true);
-            } catch (Exception e){
+            } catch (Throwable e){
                 e.printStackTrace();
                 logger.error(e);
             }
@@ -218,7 +250,6 @@ public class FileConsumer extends NewCDMConsumer {
             System.exit(-1);
         }
     }
-
     public static void main(String [] args){
         consumerGroupID = "FileConsumer";
         args = transArgs(args);
@@ -226,28 +257,28 @@ public class FileConsumer extends NewCDMConsumer {
             logger.error(usage());
             System.exit(1);
         }
-        
+
         parseAdditionalArgs(args);
-        
-        
+
         final FileConsumer tconsumer = new FileConsumer();
         //start the consumer
         tconsumer.start();
-        
+
         // add a shutdown hook to clean up the consumer
         Runtime.getRuntime().addShutdownHook(new Thread(){
             public void run(){
                 try {
                     logger.info("Shutting down consumer");
+                    logger.info("Total processed records count: " + tconsumer.getCount());
                     tconsumer.setShutdown();
                     tconsumer.join();
-                } catch (Exception e){
+                } catch (Throwable e){
                     e.printStackTrace();
                 }
             }
         });
     }
-    
+
     public String getConfig() {  
         char separator = '=';
         char fseparator = ',';
@@ -261,7 +292,7 @@ public class FileConsumer extends NewCDMConsumer {
         return cfg.toString();
     }
 
-    protected void processCompiledRecord(String key, TCCDMDatum datum) throws Exception {
+    protected void processCompiledRecord(String key, TCCDMDatum datum) throws java.lang.Exception {
         super.handleCheckers(key, datum);
         Object record = datum.getDatum();
 
@@ -281,44 +312,44 @@ public class FileConsumer extends NewCDMConsumer {
                     skipStartKey = -1;
                     skipping = false;
                 }
-            } catch (Exception ex) {
+            } catch (Throwable ex) {
                 ex.printStackTrace();
             }
         }
 
-        try {
-            // 动态加载类
-            Class<?> cls = Class.forName(clsName);
-
-            // 查找并调用 getUuid 方法
-            Method getUuidMethod = cls.getMethod("getUuid");
-            Object uuid = getUuidMethod.invoke(record);
-
-            // 检查 UUID 是否为 111123
-            if (uuid != null) {
-                UUID uuid1 = (UUID) uuid;
-                Schema schema = uuid1.getSchema();
-                if (schema != null) {
-//                    // 创建 Avro JSON 编码器
-                    if (readableJsonEncoder1 == null) {
-                        readableJsonEncoder1 = new ReadableJsonEncoder1(UUID_SCHEMA, outputStream, false);
-                    }
-                    writer.write(uuid1, readableJsonEncoder1);
-                    readableJsonEncoder1.flush();
-                    String s = outputStream.toString().trim();
-                    if (s.equals("\"FB1F9E30-0000-0000-0000-000000000020\"")) {
-                        logger.info("find=====");
-                    }
-                    if (outputStream != null) outputStream.reset();
-                }
-            }
-        } catch (ClassNotFoundException e) {
-            logger.error("Class not found: " + clsName, e);
-        } catch (NoSuchMethodException e) {
-            logger.error("Method 'getUuid' not found in class: " + clsName, e);
-        } catch (Exception e) {
-            e.printStackTrace();
-        }
+//        try {
+//            // 动态加载类
+//            Class<?> cls = Class.forName(clsName);
+//
+//            // 查找并调用 getUuid 方法
+//            Method getUuidMethod = cls.getMethod("getUuid");
+//            Object uuid = getUuidMethod.invoke(record);
+//
+//            // 检查 UUID 是否为 111123
+//            if (uuid != null) {
+//                UUID uuid1 = (UUID) uuid;
+//                Schema schema = uuid1.getSchema();
+//                if (schema != null) {
+////                    // 创建 Avro JSON 编码器
+//                    if (readableJsonEncoder1 == null) {
+//                        readableJsonEncoder1 = new ReadableJsonEncoder1(UUID_SCHEMA, outputStream, false);
+//                    }
+//                    writer.write(uuid1, readableJsonEncoder1);
+//                    readableJsonEncoder1.flush();
+//                    String s = outputStream.toString().trim();
+//                    if (s.equals("\"3120B2A9-057E-E4EB-4BB9-154983D2C063\"")) {
+//                        logger.info("find=====");
+//                    }
+//                    if (outputStream != null) outputStream.reset();
+//                }
+//            }
+//        } catch (ClassNotFoundException e) {
+//            logger.error("Class not found: " + clsName, e);
+//        } catch (NoSuchMethodException e) {
+//            logger.error("Method 'getUuid' not found in class: " + clsName, e);
+//        } catch (Exception e) {
+//            e.printStackTrace();
+//        }
 
 
         try {
@@ -337,15 +368,26 @@ public class FileConsumer extends NewCDMConsumer {
 
                 // 将 Instant 转换为 UTC 时间的 LocalDateTime
                 LocalDateTime logTime = LocalDateTime.ofInstant(instant, ZoneId.of("America/New_York"));
-//                LocalDateTime timeBaseLineStart = LocalDateTime.of(2018, 4, 12, 12, 44, 0);
-                LocalDateTime timeBaseLineStart = LocalDateTime.of(2015, 4, 1, 11, 0, 0);
+                if (showTime){
+                    logger.info("logTime" + logTime);
+                }
 
-                LocalDateTime timeBaseLineEnd = LocalDateTime.of(2018, 4, 12, 13, 26, 0);
-                if (logTime.isAfter(timeBaseLineStart) && logTime.isBefore(timeBaseLineEnd)) {
-//                    System.out.println(logTime);
+//                LocalDateTime timeBaseLineStart = LocalDateTime.of(2018, 4, 12, 12, 44, 0);
+//                LocalDateTime timeBaseLineStart = LocalDateTime.of(2015, 4, 1, 11, 0, 0);
+//                LocalDateTime timeBaseLineEnd = LocalDateTime.of(2018, 4, 12, 13, 26, 0);
+//                LocalDateTime timeBaseLineStart = LocalDateTime.of(2018, 3, 15, 0, 0, 0);
+//                LocalDateTime timeBaseLineEnd = LocalDateTime.of(2018, 3, 16, 0, 0, 0);
+//                LocalDateTime timeBaseLineStart = LocalDateTime.of(2018, 4, 2, 0, 0, 0);
+//                LocalDateTime timeBaseLineEnd = LocalDateTime.of(2018, 4, 3, 0, 0, 0);
+                if (timeBaseLineStart == null || logTime.isAfter(timeBaseLineStart)){
                     logStartRecord = true;
                 }
-                if (logTime.isAfter(timeBaseLineEnd)) {
+
+//                if (logTime.isAfter(timeBaseLineStart) && logTime.isBefore(timeBaseLineEnd)) {
+////                    System.out.println(logTime);
+//                    logStartRecord = true;
+//                }
+                if (timeBaseLineEnd != null && logTime.isAfter(timeBaseLineEnd)) {
                     logStartRecord = false;
                 }
             }
@@ -354,18 +396,18 @@ public class FileConsumer extends NewCDMConsumer {
 //            logger.error("Class not found: " + clsName, e);
         } catch (NoSuchMethodException e) {
 //            logger.error("Method 'getTimestampNanos' not found in class: " + clsName, e);
-        } catch (Exception e) {
+        } catch (Throwable e) {
             e.printStackTrace();
         }
 
-        if (count == 0 && logStartRecord) {
-            System.out.println("log record start");
+        if (count.get() == 0 && logStartRecord) {
+            logger.info("log record start time");
         }
         if (logStartRecord) {
-            count++;
+            count.incrementAndGet();
             if (writeJson) {
                 logger.debug("Writing record to JSON file");
-                jsonFileSerializer.serializeToFile(datum);
+                jsonFileSerializer.serializeToFile(datum, filterUUIDs);
             }
             if (writeBinary) {
                 logger.debug("Writing record to Binary file");
@@ -373,10 +415,10 @@ public class FileConsumer extends NewCDMConsumer {
             }
             checkRollover();
         }
-        if (count != 0 && !logStartRecord) {
-            System.out.println("log record end. count: " + count);
-            count = 0;
-        }
+//        if (count != 0 && !logStartRecord) {
+//            System.out.println("log record end. count: " + count);
+//            count = 0;
+//        }
     }
 
 
